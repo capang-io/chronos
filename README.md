@@ -53,7 +53,8 @@ curl -X POST http://localhost:8080/run
 
 Check status:
 ```bash
-curl http://localhost:8080/status?key={job-id}
+JOB_ID="12345"
+curl "http://localhost:8080/status?key=${JOB_ID}"
 ```
 
 ## Roadmap
