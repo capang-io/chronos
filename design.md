@@ -135,21 +135,3 @@ curl -X POST http://localhost:8080/run \
 ```bash
 curl http://localhost:8080/status?key=batch-001
 ```
-
----
-
-## Conclusion
-
-**Chronos** is a lightweight and performant solution for bulk job processing with:
-- ✅ Scalable asynchronous processing
-- ✅ State tracking in Redis
-- ✅ Configurable worker pool
-- ✅ Temporary file management
-- ✅ Robust error handling
-
-Ideal for scenarios such as:
-- Bulk data transformation
-- Batch API requests
-- ETL pipelines
-- Webhook delivery systems
-- Report generation
