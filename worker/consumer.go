@@ -55,13 +55,18 @@ func Task(payload string, conf models.Configuration) (string, int, error) {
 	// Prepare the payload
 	jsonPayload := bytes.NewBufferString(payload)
 
-	// Perform the request
-	resp, err := http.Post(uri, "application/json", jsonPayload)
+	// Build request and use pooled client (getHTTPClient())
+	req, err := http.NewRequest("POST", uri, jsonPayload)
+	if err != nil {
+		return "", 0, fmt.Errorf("error creating request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := getHTTPClient()
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", 0, fmt.Errorf("error sending POST request: %w", err)
 	}
-
-	// Ensure the response body is closed to prevent leaks
 	defer resp.Body.Close()
 
 	// Read the response body
