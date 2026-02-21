@@ -52,10 +52,37 @@ func GetInstance() (*Cache, error) {
 			db, _ = strconv.Atoi(dbStr)
 		}
 
+		// Pool and timeout tuning with sane defaults, overridable via env
+		poolSize := 10
+		if s := os.Getenv("REDIS_POOL_SIZE"); s != "" {
+			if n, e := strconv.Atoi(s); e == nil {
+				poolSize = n
+			}
+		}
+
+		minIdle := 2
+		if s := os.Getenv("REDIS_MIN_IDLE"); s != "" {
+			if n, e := strconv.Atoi(s); e == nil {
+				minIdle = n
+			}
+		}
+
+		dialTimeout := 5 * time.Second
+		readTimeout := 5 * time.Second
+		writeTimeout := 5 * time.Second
+
 		rdb := redis.NewClient(&redis.Options{
-			Addr:     os.Getenv("REDIS_ADDR"),
-			Password: os.Getenv("REDIS_PASSWORD"),
-			DB:       db,
+			Addr:            os.Getenv("REDIS_ADDR"),
+			Password:        os.Getenv("REDIS_PASSWORD"),
+			DB:              db,
+			PoolSize:        poolSize,
+			MinIdleConns:    minIdle,
+			DialTimeout:     dialTimeout,
+			ReadTimeout:     readTimeout,
+			WriteTimeout:    writeTimeout,
+			MaxRetries:      3,
+			MinRetryBackoff: 100 * time.Millisecond,
+			MaxRetryBackoff: 1 * time.Second,
 		})
 
 		// Verify connection
@@ -110,13 +137,14 @@ func (c *Cache) WriteToCache(status models.ResponseStatus) error {
 
 	key := fmt.Sprintf("%s:%d", status.PrimaryKey, status.RowKey)
 
-	// 1. Write the main data
-	err = c.client.Set(ctx, key, data, DefaultTTL).Err()
-	if err != nil {
+	// Use a pipeline to reduce round-trips for the write
+	pipe := c.client.Pipeline()
+	pipe.Set(ctx, key, data, DefaultTTL)
+	if _, err := pipe.Exec(ctx); err != nil {
 		return err
 	}
 
-	// 2. Update the aggregated statistics
+	// Update stats using a Lua script (atomic min/max + incr)
 	return c.UpdateStats(status.PrimaryKey, now)
 }
 
@@ -126,41 +154,28 @@ func (c *Cache) UpdateStats(primaryKey string, insertionTime time.Time) error {
 
 	// Convert time to string for storage
 	newTimeStr := insertionTime.Format(time.RFC3339Nano)
+	// Lua script to atomically HINCRBY, update min/max and set TTL
+	script := `
+local statsKey = KEYS[1]
+local newTime = ARGV[1]
+local ttl = tonumber(ARGV[2])
+redis.call('HINCRBY', statsKey, 'count', 1)
+local curMin = redis.call('HGET', statsKey, 'min_time')
+if (not curMin) or (newTime < curMin) then
+  redis.call('HSET', statsKey, 'min_time', newTime)
+end
+local curMax = redis.call('HGET', statsKey, 'max_time')
+if (not curMax) or (newTime > curMax) then
+  redis.call('HSET', statsKey, 'max_time', newTime)
+end
+if ttl and ttl > 0 then
+  redis.call('EXPIRE', statsKey, ttl)
+end
+return 1
+`
 
-	// Increment count
-	err := c.client.HIncrBy(ctx, statsKey, "count", 1).Err()
-	if err != nil {
-		return err
-	}
-
-	// Handle Min/Max logic: we use a transaction to fetch current values and update if necessary
-	res, err := c.client.HMGet(ctx, statsKey, "min_time", "max_time").Result()
-	if err != nil {
-		return err
-	}
-
-	// Logic to update Min
-	if res[0] == nil {
-		c.client.HSet(ctx, statsKey, "min_time", newTimeStr)
-	} else {
-		currentMin, _ := time.Parse(time.RFC3339Nano, res[0].(string))
-		if insertionTime.Before(currentMin) {
-			c.client.HSet(ctx, statsKey, "min_time", newTimeStr)
-		}
-	}
-
-	// Logic to update Max
-	if res[1] == nil {
-		c.client.HSet(ctx, statsKey, "max_time", newTimeStr)
-	} else {
-		currentMax, _ := time.Parse(time.RFC3339Nano, res[1].(string))
-		if insertionTime.After(currentMax) {
-			c.client.HSet(ctx, statsKey, "max_time", newTimeStr)
-		}
-	}
-
-	// Keep the stats alive for the same duration as the data
-	return c.client.Expire(ctx, statsKey, DefaultTTL).Err()
+	ttlSeconds := int(DefaultTTL.Seconds())
+	return c.client.Eval(ctx, script, []string{statsKey}, newTimeStr, ttlSeconds).Err()
 }
 
 // Listen waits for updates on the channel and writes them to Redis
@@ -180,21 +195,48 @@ func (c *Cache) GetData(primaryKey string) ([]CacheEntry, error) {
 	// Use Scan instead of Keys to avoid blocking the Redis server on large databases
 	iter := c.client.Scan(ctx, 0, prefix, 0).Iterator()
 
-	for iter.Next(ctx) {
-		key := iter.Val()
-		val, err := c.client.Get(ctx, key).Result()
+	// Batch keys to use MGET and reduce round-trips
+	batch := make([]string, 0, 128)
+	const batchSize = 100
+
+	flushBatch := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		vals, err := c.client.MGet(ctx, batch...).Result()
 		if err != nil {
-			log.Printf("Error getting value for key %s: %v", key, err)
-			continue
+			return err
 		}
 
-		results = append(results, CacheEntry{
-			Key:   key,
-			Value: val,
-		})
+		for i, v := range vals {
+			if v == nil {
+				continue
+			}
+			if str, ok := v.(string); ok {
+				results = append(results, CacheEntry{Key: batch[i], Value: str})
+			} else if b, ok := v.([]byte); ok {
+				results = append(results, CacheEntry{Key: batch[i], Value: string(b)})
+			}
+		}
+		batch = batch[:0]
+		return nil
+	}
+
+	for iter.Next(ctx) {
+		key := iter.Val()
+		batch = append(batch, key)
+		if len(batch) >= batchSize {
+			if err := flushBatch(); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	if err := iter.Err(); err != nil {
+		return nil, err
+	}
+
+	if err := flushBatch(); err != nil {
 		return nil, err
 	}
 
